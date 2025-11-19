@@ -1,9 +1,10 @@
 streamlit
 opencv-python
-mediapipe==0.10.21
+mediapipe==0.10.14
 numpy
 pillow
 joblib
 scikit-learn
+
 
 
