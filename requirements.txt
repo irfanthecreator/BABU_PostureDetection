@@ -1,10 +1,7 @@
-opencv-python
-mediapipe
-numpy
 streamlit
-playsound
+opencv-python
+mediapipe==0.10.14
+numpy
 pillow
-playsound==1.2.2
-scikit-learn
-pandas
 joblib
+scikit-learn
