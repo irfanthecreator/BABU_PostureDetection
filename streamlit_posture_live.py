@@ -1,11 +1,13 @@
-import streamlit as st
+import time
+import threading
+import os
+
 import cv2
 import mediapipe as mp
 import numpy as np
 import joblib
-import time
-import threading
-import os
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode, RTCConfiguration
 
 # winsound is Windows-only; make it optional so the app works on Linux (Streamlit Cloud)
 try:
@@ -16,13 +18,16 @@ except ImportError:
     HAS_WINSOUND = False
 
 
-# ================= SETUP =================
+# ====================== CONFIG ======================
 MODEL_PATH = "posture_model_best.pkl"  # or "posture_model.pkl"
+BAD_THRESHOLD = 5.0  # seconds of continuous bad posture before beep
 
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
-BAD_THRESHOLD = 5.0  # seconds of continuous bad posture before beep
+RTC_CONFIGURATION = {
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+}
 
 
 @st.cache_resource
@@ -41,11 +46,11 @@ clf = load_model(MODEL_PATH)
 
 
 def beep_alert():
-    """Short beep in a separate thread so it doesn't freeze video.
-    On non-Windows (no winsound), this is a no-op.
+    """
+    Short beep in a separate thread.
+    On non-Windows (no winsound), this does nothing.
     """
     if not HAS_WINSOUND:
-        # On Streamlit Cloud (Linux), skip sound
         return
 
     def _beep():
@@ -55,6 +60,11 @@ def beep_alert():
 
 
 def landmarks_to_feature_vector(landmarks):
+    """
+    Same feature extraction as training:
+    NOSE, L_EAR, R_EAR, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP
+    -> 7 joints * (x,y,z) = 21 features
+    """
     key_ids = [
         mp_pose.PoseLandmark.NOSE,
         mp_pose.PoseLandmark.LEFT_EAR,
@@ -71,140 +81,171 @@ def landmarks_to_feature_vector(landmarks):
     return features
 
 
-def predict_posture(frame, pose):
-    """Run Mediapipe + model prediction on a frame."""
-    # if model didn't load, don't crash
-    if clf is None:
-        return frame, None, 0.0
-
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = pose.process(rgb)
-
-    if not result.pose_landmarks:
-        return frame, None, 0.0
-
-    # draw skeleton
-    mp_drawing.draw_landmarks(
-        frame, result.pose_landmarks, mp_pose.POSE_CONNECTIONS
-    )
-
-    feats = np.array(
-        landmarks_to_feature_vector(result.pose_landmarks.landmark)
-    ).reshape(1, -1)
-
-    probs = clf.predict_proba(feats)[0]
-    classes = clf.classes_
-    idx = probs.argmax()
-    label = classes[idx]
-    conf = probs[idx]
-
-    return frame, label, conf
-
-
-# ================= UI =================
-st.set_page_config(page_title="Live Posture Detection", page_icon="🟢")
-st.title("🟢 REAL-TIME AI Posture Detection (Streamlit Live)")
-st.write(
-    f"Model: `{MODEL_PATH}`  •  Beeps after {BAD_THRESHOLD:.0f} seconds of continuous bad posture "
-    f"(sound only works on Windows)."
-)
-
-start_btn = st.button("Start Webcam")
-
-FRAME_WINDOW = st.empty()
-info_box = st.empty()
-timer_box = st.empty()
-
-if start_btn:
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        info_box.error("Cannot access webcam. "
-                       "On Streamlit Cloud, the server cannot see your local camera.")
-    else:
-        bad_start_time = None
-        bad_beeped = False
-
-        with mp_pose.Pose(
+# ================== VIDEO PROCESSOR ==================
+class PostureVideoProcessor(VideoTransformerBase):
+    def __init__(self):
+        # mediapipe pose instance (reuse for all frames)
+        self.pose = mp_pose.Pose(
             static_image_mode=False,
             model_complexity=0,
             enable_segmentation=False,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
-        ) as pose:
+        )
 
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    info_box.error("Cannot read from webcam.")
-                    break
+        # timing for bad posture
+        self.bad_start_time = None
+        self.bad_beeped = False
+        self.last_label = None
+        self.last_conf = 0.0
+        self.last_bad_duration = 0.0
 
-                # mirror like a mirror
-                frame = cv2.flip(frame, 1)
+    def recv(self, frame):
+        # frame from browser → numpy BGR
+        img = frame.to_ndarray(format="bgr24")
 
-                frame, label, conf = predict_posture(frame, pose)
-                now = time.time()
+        # mirror horizontally (like webcam)
+        img = cv2.flip(img, 1)
 
-                # ----- bad posture timing logic -----
-                bad_duration = 0.0
-                if label == "bad":
-                    if bad_start_time is None:
-                        bad_start_time = now  # start timing
-                    bad_duration = now - bad_start_time
+        # if model failed to load, just return the image
+        if clf is None:
+            cv2.putText(
+                img,
+                "Model not loaded",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                2,
+            )
+            from av import VideoFrame
+            return VideoFrame.from_ndarray(img, format="bgr24")
 
-                    # beep once when threshold crossed
-                    if bad_duration >= BAD_THRESHOLD and not bad_beeped:
-                        beep_alert()
-                        bad_beeped = True
+        # run mediapipe
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        result = self.pose.process(rgb)
 
-                    # draw timer text on frame
-                    cv2.putText(
-                        frame,
-                        f"BAD for {bad_duration:.1f}s",
-                        (10, 65),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 0, 255),
-                        2,
-                    )
-                else:
-                    # reset timer if posture is good or no label
-                    bad_start_time = None
-                    bad_beeped = False
+        label = None
+        conf = 0.0
+        now = time.time()
+        bad_duration = 0.0
 
-                # ----- main label text -----
-                if label is None:
-                    info_box.warning("No pose detected or model not loaded...")
-                    timer_box.empty()
-                else:
-                    color = (0, 255, 0) if label == "good" else (0, 0, 255)
-                    cv2.putText(
-                        frame,
-                        f"{label.upper()} ({conf*100:.1f}%)",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        color,
-                        2,
-                    )
+        if result.pose_landmarks:
+            # draw skeleton
+            mp_drawing.draw_landmarks(
+                img, result.pose_landmarks, mp_pose.POSE_CONNECTIONS
+            )
 
-                    info_box.success(f"Posture: {label.upper()}  ({conf*100:.1f}%)")
-                    if label == "bad":
-                        timer_box.warning(
-                            f"BAD posture for {bad_duration:.1f} seconds "
-                            f"(beep at {BAD_THRESHOLD:.0f}s)"
-                        )
-                    else:
-                        timer_box.info("Posture is GOOD ✅")
+            feats = np.array(
+                landmarks_to_feature_vector(result.pose_landmarks.landmark)
+            ).reshape(1, -1)
 
-                # show frame in Streamlit
-                FRAME_WINDOW.image(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    channels="RGB",
+            probs = clf.predict_proba(feats)[0]
+            classes = clf.classes_
+            idx = probs.argmax()
+            label = classes[idx]
+            conf = probs[idx]
+
+            # ===== bad posture timing logic =====
+            if label == "bad":
+                if self.bad_start_time is None:
+                    self.bad_start_time = now
+                bad_duration = now - self.bad_start_time
+
+                if bad_duration >= BAD_THRESHOLD and not self.bad_beeped:
+                    beep_alert()
+                    self.bad_beeped = True
+
+                # draw timer
+                cv2.putText(
+                    img,
+                    f"BAD for {bad_duration:.1f}s",
+                    (10, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
                 )
+            else:
+                self.bad_start_time = None
+                self.bad_beeped = False
 
-                # safety break to avoid infinite loop if cap suddenly closes
-                if not cap.isOpened():
-                    break
+            # ===== main label text =====
+            color = (0, 255, 0) if label == "good" else (0, 0, 255)
+            cv2.putText(
+                img,
+                f"{label.upper()} ({conf*100:.1f}%)",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                color,
+                2,
+            )
+        else:
+            # no pose detected
+            cv2.putText(
+                img,
+                "No pose detected",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                2,
+            )
 
-        cap.release()
+        # store last info so UI can read it if needed
+        self.last_label = label
+        self.last_conf = conf
+        self.last_bad_duration = bad_duration
+
+        from av import VideoFrame
+        return VideoFrame.from_ndarray(img, format="bgr24")
+
+
+# ====================== STREAMLIT UI ======================
+st.set_page_config(page_title="Live Posture Detection (WebRTC)", page_icon="🟢")
+
+st.title("🟢 REAL-TIME AI Posture Detection (WebRTC)")
+st.write(
+    f"Model: `{MODEL_PATH}` • Beeps after {BAD_THRESHOLD:.0f} seconds of continuous bad posture "
+    f"(sound only works on Windows, and only if running locally)."
+)
+st.write(
+    "➡ Allow camera access in your browser.\n"
+    "Frames from your webcam are sent to the server, where Mediapipe + your model "
+    "run in real-time, then the processed video is streamed back."
+)
+
+webrtc_ctx = webrtc_streamer(
+    key="posture-live",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={"video": True, "audio": False},
+    video_processor_factory=PostureVideoProcessor,
+    async_processing=True,
+)
+
+# Optional: show live status text under the video
+status_placeholder = st.empty()
+
+if webrtc_ctx and webrtc_ctx.video_processor:
+    vp = webrtc_ctx.video_processor
+    # this block will rerun repeatedly as Streamlit reruns the script
+    label = vp.last_label
+    conf = vp.last_conf
+    bad_duration = vp.last_bad_duration
+
+    if label is None:
+        status_placeholder.warning("No pose detected yet…")
+    else:
+        if label == "good":
+            status_placeholder.success(
+                f"Posture: GOOD ({conf*100:.1f}%)."
+            )
+        else:
+            status_placeholder.warning(
+                f"Posture: BAD ({conf*100:.1f}%). "
+                f"Bad for {bad_duration:.1f}s (beep at {BAD_THRESHOLD:.0f}s)."
+            )
+else:
+    status_placeholder.info("Click on the video box and allow camera access to start.")
