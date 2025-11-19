@@ -4,8 +4,17 @@ import mediapipe as mp
 import numpy as np
 from PIL import Image
 import joblib
-import winsound
 import threading
+import os
+
+# winsound is Windows-only; make it optional so the app works on Linux (Streamlit Cloud)
+try:
+    import winsound
+    HAS_WINSOUND = True
+except ImportError:
+    winsound = None
+    HAS_WINSOUND = False
+
 
 # ==== CONFIG ====
 MODEL_PATH = "posture_model_best.pkl"  # or "posture_model.pkl"
@@ -13,18 +22,33 @@ MODEL_PATH = "posture_model_best.pkl"  # or "posture_model.pkl"
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
+
 # ---- load trained model (cached) ----
 @st.cache_resource
-def load_model(path):
+def load_model(path: str):
+    if not os.path.exists(path):
+        # show a clear error if the model file isn't in the repo
+        st.error(f"Model file '{path}' not found. "
+                 f"Make sure it is in the app folder on GitHub.")
+        return None
     return joblib.load(path)
+
 
 clf = load_model(MODEL_PATH)
 
 
 def beep_alert():
-    """short beep in a thread so the UI doesn't freeze"""
+    """Short beep in a thread so the UI doesn't freeze.
+    On non-Windows systems (no winsound), this does nothing.
+    """
+    if not HAS_WINSOUND:
+        # On Streamlit Cloud (Linux), just skip the sound
+        return
+
     def _beep():
-        winsound.Beep(1000, 300)  # 1000 Hz, 0.3s
+        # 1000 Hz for 300 ms
+        winsound.Beep(1000, 300)
+
     threading.Thread(target=_beep, daemon=True).start()
 
 
@@ -50,13 +74,18 @@ def landmarks_to_feature_vector(landmarks):
     return features
 
 
-def analyze_image(pil_img):
+def analyze_image(pil_img: Image.Image):
     """
     Run Mediapipe on the image, classify posture, and return:
     - output image with skeleton + text
     - predicted label
     - confidence
     """
+    if clf is None:
+        # model failed to load
+        return np.array(pil_img.convert("RGB")), None, None
+
+    # convert PIL image to OpenCV BGR
     img = np.array(pil_img.convert("RGB"))  # RGB
     img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
@@ -67,6 +96,7 @@ def analyze_image(pil_img):
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ) as pose:
+        # mediapipe expects RGB
         results = pose.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
         if not results.pose_landmarks:
@@ -103,7 +133,7 @@ def analyze_image(pil_img):
             2,
         )
 
-        # convert back to RGB for display
+        # convert back to RGB for display in Streamlit
         out_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         return out_img, pred_label, pred_conf
 
@@ -115,7 +145,7 @@ st.set_page_config(page_title="AI Posture Test App", page_icon="🧍", layout="c
 st.title("🧍 AI Posture Classifier (Streamlit Test)")
 st.write(
     "Upload a photo or use the camera to test the trained posture model. "
-    "If posture is **BAD**, a beep will play."
+    "If posture is **BAD**, a beep will play (on Windows)."
 )
 
 tab1, tab2 = st.tabs(["📁 Upload Image", "📷 Use Camera"])
@@ -128,16 +158,17 @@ with tab1:
 
     if uploaded_file is not None:
         pil_img = Image.open(uploaded_file)
-        st.image(pil_img, caption="Original Image", use_column_width=True)
+        st.image(pil_img, caption="Original Image", use_container_width=True)
 
         if st.button("Analyze Uploaded Image", key="analyze_upload"):
             with st.spinner("Analyzing posture..."):
                 out_img, label, conf = analyze_image(pil_img)
 
             if label is None:
-                st.warning("No pose detected. Try another image or clearer view.")
+                st.warning("No pose detected or model not loaded. "
+                           "Try another image or check the model file.")
             else:
-                st.image(out_img, caption="Pose & Prediction", use_column_width=True)
+                st.image(out_img, caption="Pose & Prediction", use_container_width=True)
                 st.success(f"Prediction: **{label.upper()}** ({conf*100:.1f}%)")
                 if label == "bad":
                     beep_alert()
@@ -150,16 +181,17 @@ with tab2:
 
     if camera_img is not None:
         pil_cam_img = Image.open(camera_img)
-        st.image(pil_cam_img, caption="Captured Image", use_column_width=True)
+        st.image(pil_cam_img, caption="Captured Image", use_container_width=True)
 
         if st.button("Analyze Camera Image", key="analyze_camera"):
             with st.spinner("Analyzing posture..."):
                 out_img, label, conf = analyze_image(pil_cam_img)
 
             if label is None:
-                st.warning("No pose detected. Try sitting fully in frame, side view.")
+                st.warning("No pose detected or model not loaded. "
+                           "Try sitting fully in frame, side view.")
             else:
-                st.image(out_img, caption="Pose & Prediction", use_column_width=True)
+                st.image(out_img, caption="Pose & Prediction", use_container_width=True)
                 st.success(f"Prediction: **{label.upper()}** ({conf*100:.1f}%)")
                 if label == "bad":
                     beep_alert()
